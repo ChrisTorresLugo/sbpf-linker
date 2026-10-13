@@ -3,6 +3,7 @@ use aya_rustc_llvm_proxy as _;
 
 pub mod byteparser;
 pub mod fuse_args_stack;
+pub mod signed_div;
 use std::collections::HashSet;
 use std::io;
 
@@ -56,6 +57,10 @@ pub enum SbpfLinkerError {
         "Error handling rodata relocation in section={section} address={address:#x}: {detail}"
     )]
     RodataRelocationError { section: String, address: u64, detail: String },
+    #[error(
+        "Error lowering signed division at text offset {offset:#x}: {detail}"
+    )]
+    SignedDivisionError { offset: u64, detail: String },
 }
 
 impl SbpfLinkerError {

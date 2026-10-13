@@ -14,11 +14,12 @@ use object::{
     File, Object as _, ObjectSection as _, ObjectSymbol as _, SectionIndex,
 };
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::fuse_args_stack::{
     FunctionRange, diagnose_stack_arg_overlaps, rewrite_r11_stack_args,
 };
+use crate::signed_div::{lower_signed_division, unsigned_form};
 
 fn decode_instruction_for_arch(
     data: &[u8],
@@ -331,6 +332,7 @@ pub fn parse_bytecode(
     }
 
     let mut debug_sections = Vec::default();
+    let mut signed_division_offsets: HashSet<u64> = HashSet::new();
     ast.set_rodata_size(rodata_size);
 
     for section in obj.sections() {
@@ -342,6 +344,15 @@ pub fn parse_bytecode(
             let mut offset = 0;
             while offset < section_data.len() {
                 let data = &section_data[offset..];
+                // LLVM marks signed div/mod with a nonzero offset field that
+                // the SBPF decoder rejects. Decode the unsigned form and
+                // remember the site; it is lowered once the AST is complete.
+                let signed = unsigned_form(data);
+                if signed.is_some() {
+                    signed_division_offsets
+                        .insert(section_base + offset as u64);
+                }
+                let data = signed.as_ref().map_or(data, |bytes| &bytes[..]);
                 match decode_instruction_for_arch(data, arch) {
                     Ok(instruction) => {
                         let node_len = match instruction.opcode {
@@ -622,6 +633,10 @@ pub fn parse_bytecode(
     if !errors.is_empty() {
         return Err(errors);
     }
+
+    let text_growth =
+        lower_signed_division(&mut ast, &signed_division_offsets, arch)?;
+    ast.set_text_size(text_size + text_growth);
 
     let mut compile_errors =
         rewrite_r11_stack_args(&mut ast, stack_frame_size)

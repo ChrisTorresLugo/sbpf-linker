@@ -24,6 +24,7 @@ use sbpf_common::{
 };
 use sbpf_linker::{
     ProgramOptions, SbpfLinkerError, byteparser::parse_bytecode,
+    signed_div::unsigned_form,
 };
 
 const NO_TESTS_FILTER: &str = "__no_tests_match_this_sbpf_arch__";
@@ -415,8 +416,13 @@ fn collect_syscall_labels<A: TestArch>(
     let mut labels = HashMap::new();
     let mut offset = 0usize;
     while offset < data.len() {
+        // Signed division only decodes in its unsigned form; see
+        // `sbpf_linker::signed_div`.
+        let unsigned = unsigned_form(&data[offset..]);
+        let instruction_bytes =
+            unsigned.as_ref().map_or(&data[offset..], |bytes| &bytes[..]);
         let instruction =
-            A::decode_instruction(&data[offset..]).map_err(|err| {
+            A::decode_instruction(instruction_bytes).map_err(|err| {
                 anyhow::anyhow!("failed to decode .text at {offset:#x}: {err}")
             })?;
         if instruction.opcode == Opcode::Call
