@@ -1,3 +1,4 @@
+use either::Either;
 use object::write::{Object, Relocation, SectionId, Symbol, SymbolSection};
 use object::{
     Architecture, BinaryFormat, Endianness, RelocationEncoding,
@@ -5,12 +6,15 @@ use object::{
     SymbolScope,
 };
 use sbpf_assembler::{OptimizationConfig, SbpfArch, astnode::ASTNode};
+use sbpf_common::{inst_param::Number, opcode::Opcode};
 use sbpf_linker::{
     ProgramOptions, SbpfLinkerError, byteparser::parse_bytecode,
 };
 
 const STACK_FRAME_SIZE: i32 = 4096;
 const EXIT_INSTRUCTION: [u8; 8] = [0x95, 0, 0, 0, 0, 0, 0, 0];
+// murmur3_32("abort"), the static syscall identifier.
+const ABORT_SYSCALL_HASH: u32 = 0xb6fc_1a11;
 
 #[test]
 fn rodata_relocation_rejects_undefined_target() {
@@ -138,6 +142,130 @@ fn rodata_relocation_handles_interior_text_target() {
                 if label.name == ".text.__at__0x8" && *offset == 8
         )
     }));
+}
+
+#[test]
+fn undefined_bpf_trap_call_becomes_abort_syscall() {
+    let object = trap_call_object(SymbolSection::Undefined);
+
+    // Static syscalls are called by hash.
+    let program = parse_for_arch(&object, SbpfArch::V3)
+        .expect("trap call should resolve to a syscall");
+    assert_eq!(first_call_target(&program), i64::from(ABORT_SYSCALL_HASH));
+
+    // Dynamic syscalls are resolved by a relocation at load time.
+    let program = parse_for_arch(&object, SbpfArch::V0)
+        .expect("trap call should resolve to a syscall");
+    assert_eq!(first_call_target(&program), -1);
+    assert!(!program.prog_is_static);
+}
+
+#[test]
+fn defined_bpf_trap_is_called_directly() {
+    // The program provides `__bpf_trap` itself, right after `entrypoint`.
+    let (object, text) = trap_call_sections();
+    let object = finish_trap_call_object(object, text, |text| {
+        SymbolSection::Section(text)
+    });
+
+    let program = parse_for_arch(&object, SbpfArch::V3)
+        .expect("call to a defined function should link");
+    // A relative call from offset 0 to offset 16.
+    assert_eq!(first_call_target(&program), 1);
+}
+
+// `call <relocated>; exit; exit`, with `entrypoint` covering the first two
+// instructions.
+fn trap_call_sections() -> (Object<'static>, SectionId) {
+    let mut object =
+        Object::new(BinaryFormat::Elf, Architecture::Sbf, Endianness::Little);
+    let text =
+        object.add_section(Vec::new(), b".text".to_vec(), SectionKind::Text);
+    let call = [0x85, 0x10, 0, 0, 0xff, 0xff, 0xff, 0xff];
+    let code = [call, EXIT_INSTRUCTION, EXIT_INSTRUCTION].concat();
+    object.append_section_data(text, &code, 8);
+    object.add_symbol(Symbol {
+        name: b"entrypoint".to_vec(),
+        value: 0,
+        size: 16,
+        kind: SymbolKind::Text,
+        scope: SymbolScope::Linkage,
+        weak: false,
+        section: SymbolSection::Section(text),
+        flags: SymbolFlags::None,
+    });
+    (object, text)
+}
+
+fn finish_trap_call_object(
+    mut object: Object<'static>,
+    text: SectionId,
+    trap_section: impl FnOnce(SectionId) -> SymbolSection,
+) -> Vec<u8> {
+    let section = trap_section(text);
+    let defined = matches!(section, SymbolSection::Section(_));
+    let trap = object.add_symbol(Symbol {
+        name: b"__bpf_trap".to_vec(),
+        value: if defined { 16 } else { 0 },
+        size: if defined { 8 } else { 0 },
+        kind: SymbolKind::Text,
+        scope: SymbolScope::Linkage,
+        weak: false,
+        section,
+        flags: SymbolFlags::None,
+    });
+    object
+        .add_relocation(
+            text,
+            Relocation {
+                offset: 0,
+                symbol: trap,
+                addend: 0,
+                flags: RelocationFlags::Elf {
+                    r_type: object::elf::R_BPF_64_32,
+                },
+            },
+        )
+        .expect("failed to add call relocation");
+    object.write().expect("failed to write object")
+}
+
+fn trap_call_object(trap_section: SymbolSection) -> Vec<u8> {
+    let (object, text) = trap_call_sections();
+    finish_trap_call_object(object, text, |_| trap_section)
+}
+
+fn parse_for_arch(
+    object: &[u8],
+    arch: SbpfArch,
+) -> Result<sbpf_assembler::ProgramLayout, Vec<SbpfLinkerError>> {
+    parse_bytecode(
+        object,
+        ProgramOptions::new(
+            OptimizationConfig::enabled(),
+            arch,
+            STACK_FRAME_SIZE,
+        ),
+    )
+}
+
+fn first_call_target(program: &sbpf_assembler::ProgramLayout) -> i64 {
+    program
+        .code_section
+        .get_nodes()
+        .iter()
+        .find_map(|node| match node {
+            ASTNode::Instruction { instruction, .. }
+                if instruction.opcode == Opcode::Call =>
+            {
+                match instruction.imm {
+                    Some(Either::Right(Number::Int(target))) => Some(target),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .expect("program should contain a resolved call")
 }
 
 fn create_object_with_rodata(size: usize) -> (Object<'static>, SectionId) {
