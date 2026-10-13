@@ -1,3 +1,4 @@
+use either::Either;
 use object::write::{Object, Relocation, SectionId, Symbol, SymbolSection};
 use object::{
     Architecture, BinaryFormat, Endianness, RelocationEncoding,
@@ -5,8 +6,10 @@ use object::{
     SymbolScope,
 };
 use sbpf_assembler::{OptimizationConfig, SbpfArch, astnode::ASTNode};
+use sbpf_common::{inst_param::Number, opcode::Opcode};
 use sbpf_linker::{
-    ProgramOptions, SbpfLinkerError, byteparser::parse_bytecode,
+    ProgramOptions, SbpfLinkerError,
+    byteparser::{decode_instruction, parse_bytecode},
 };
 
 const STACK_FRAME_SIZE: i32 = 4096;
@@ -138,6 +141,70 @@ fn rodata_relocation_handles_interior_text_target() {
                 if label.name == ".text.__at__0x8" && *offset == 8
         )
     }));
+}
+
+#[test]
+fn bswap_is_decoded_as_be() {
+    for arch in [SbpfArch::V0, SbpfArch::V3] {
+        for width in [16, 32, 64] {
+            // bswap<width> r3
+            let bswap = [0xd7, 0x03, 0, 0, width, 0, 0, 0];
+            let instruction =
+                decode_instruction(&bswap, arch).expect("bswap should decode");
+            assert_eq!(instruction.opcode, Opcode::Be);
+            assert_eq!(
+                instruction.dst.as_ref().map(|register| register.n),
+                Some(3)
+            );
+            assert_eq!(
+                instruction.imm,
+                Some(Either::Right(Number::Int(i64::from(width))))
+            );
+
+            // `be<width> r3`
+            let be = [0xdc, 0x03, 0, 0, width, 0, 0, 0];
+            let encoded = if arch.is_v3() {
+                instruction.to_bytes_sbpf_v3()
+            } else {
+                instruction.to_bytes()
+            };
+            assert_eq!(encoded.unwrap(), be);
+        }
+    }
+}
+
+#[test]
+fn bswap_in_text_is_emitted_as_be() {
+    let mut object =
+        Object::new(BinaryFormat::Elf, Architecture::Sbf, Endianness::Little);
+    let text =
+        object.add_section(Vec::new(), b".text".to_vec(), SectionKind::Text);
+    let code = [[0xd7, 0x00, 0, 0, 64, 0, 0, 0], EXIT_INSTRUCTION].concat();
+    object.append_section_data(text, &code, 8);
+    object.add_symbol(Symbol {
+        name: b"entrypoint".to_vec(),
+        value: 0,
+        size: code.len() as u64,
+        kind: SymbolKind::Text,
+        scope: SymbolScope::Linkage,
+        weak: false,
+        section: SymbolSection::Section(text),
+        flags: SymbolFlags::None,
+    });
+
+    let program = parse_object(object).expect("bswap should link");
+    let opcodes = program
+        .code_section
+        .get_nodes()
+        .iter()
+        .filter_map(|node| match node {
+            ASTNode::Instruction { instruction, .. } => {
+                Some(instruction.opcode)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(opcodes, [Opcode::Be, Opcode::Exit]);
 }
 
 fn create_object_with_rodata(size: usize) -> (Object<'static>, SectionId) {

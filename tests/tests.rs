@@ -23,7 +23,8 @@ use sbpf_common::{
     opcode::Opcode,
 };
 use sbpf_linker::{
-    ProgramOptions, SbpfLinkerError, byteparser::parse_bytecode,
+    ProgramOptions, SbpfLinkerError,
+    byteparser::{decode_instruction, parse_bytecode},
 };
 
 const NO_TESTS_FILTER: &str = "__no_tests_match_this_sbpf_arch__";
@@ -32,10 +33,6 @@ const DEFAULT_STACK_FRAME_SIZE: i32 = 4096;
 
 trait TestArch {
     const ARCH: SbpfArch;
-
-    fn decode_instruction(
-        data: &[u8],
-    ) -> Result<Instruction, sbpf_common::errors::SBPFError>;
 
     fn arch_arg() -> String {
         format!("v{}", Self::ARCH.e_flags())
@@ -53,24 +50,12 @@ struct SbpfV0;
 
 impl TestArch for SbpfV0 {
     const ARCH: SbpfArch = SbpfArch::V0;
-
-    fn decode_instruction(
-        data: &[u8],
-    ) -> Result<Instruction, sbpf_common::errors::SBPFError> {
-        Instruction::from_bytes(data)
-    }
 }
 
 struct SbpfV3;
 
 impl TestArch for SbpfV3 {
     const ARCH: SbpfArch = SbpfArch::V3;
-
-    fn decode_instruction(
-        data: &[u8],
-    ) -> Result<Instruction, sbpf_common::errors::SBPFError> {
-        Instruction::from_bytes_sbpf_v3(data)
-    }
 }
 
 fn rustc_cmd() -> Command {
@@ -415,8 +400,8 @@ fn collect_syscall_labels<A: TestArch>(
     let mut labels = HashMap::new();
     let mut offset = 0usize;
     while offset < data.len() {
-        let instruction =
-            A::decode_instruction(&data[offset..]).map_err(|err| {
+        let instruction = decode_instruction(&data[offset..], A::ARCH)
+            .map_err(|err| {
                 anyhow::anyhow!("failed to decode .text at {offset:#x}: {err}")
             })?;
         if instruction.opcode == Opcode::Call
