@@ -23,10 +23,30 @@ use crate::fuse_args_stack::{
 const BPF_TRAP: &str = "__bpf_trap";
 const ABORT_SYSCALL: &str = "abort";
 
-fn decode_instruction_for_arch(
+/// BPF v4 unconditional byte swap: `BPF_ALU64 | BPF_END`.
+const BPF_BSWAP: u8 = 0xd7;
+/// SBPF `be`: `BPF_ALU | BPF_END | BPF_TO_BE`.
+const SBPF_BE: u8 = 0xdc;
+
+/// Decodes one instruction of an upstream BPF object for `arch`.
+///
+/// SBPF has no `bswap`. Its `be` instruction converts between host and
+/// big-endian order, and since SBPF is little-endian only that is the same
+/// unconditional swap, with the same 16/32/64-bit widths and zero extension.
+/// `bswap` is therefore decoded as `be`.
+pub fn decode_instruction(
     data: &[u8],
     arch: SbpfArch,
 ) -> Result<Instruction, sbpf_common::errors::SBPFError> {
+    let translated;
+    let data = match data.first_chunk::<8>() {
+        Some(&[BPF_BSWAP, operands @ ..]) => {
+            let [a, b, c, d, e, f, g] = operands;
+            translated = [SBPF_BE, a, b, c, d, e, f, g];
+            &translated[..]
+        }
+        _ => data,
+    };
     if arch.is_v3() {
         Instruction::from_bytes_sbpf_v3(data)
     } else {
@@ -345,7 +365,7 @@ pub fn parse_bytecode(
             let mut offset = 0;
             while offset < section_data.len() {
                 let data = &section_data[offset..];
-                match decode_instruction_for_arch(data, arch) {
+                match decode_instruction(data, arch) {
                     Ok(instruction) => {
                         let node_len = match instruction.opcode {
                             Opcode::Lddw => 16,
